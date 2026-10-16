@@ -1,6 +1,9 @@
 // 全局变量
 let songsData = null;
-const R2_BASE_URL = "https://r2.windsmaker.com";
+// 音乐文件存放在本仓库的 music/ 目录下，由 Cloudflare Pages 直接托管
+const MEDIA_BASE_URL = "music";
+// 通过 GitHub 仓库文件树列出 music/ 下的歌曲（公开仓库无需鉴权，一次请求取全量）
+const GITHUB_TREE_API = "https://api.github.com/repos/SophiaYangHua/WorshipMusic/git/trees/main?recursive=1";
 let currentSong = null;
 let currentPlaylist = [];
 let currentIndex = 0;
@@ -211,22 +214,69 @@ function setupAudioEventListeners() {
     });
 }
 
+// 获取歌曲清单：优先读取 GitHub 仓库 music/ 目录，失败时回退到仓库内的 songs.json 快照
+async function fetchSongList() {
+    try {
+        const response = await fetch(GITHUB_TREE_API, {
+            headers: { 'Accept': 'application/vnd.github+json' }
+        });
+        if (!response.ok) {
+            throw new Error(`API请求失败: ${response.status} ${response.statusText}`);
+        }
+        const tree = await response.json();
+        const paths = (tree.tree || []).map(item => item.path).filter(Boolean);
+        console.log(`仓库文件树共 ${paths.length} 个文件`);
+        return buildSongsFromPaths(paths);
+    } catch (error) {
+        console.warn('GitHub 歌曲清单获取失败，改用 songs.json 快照:', error);
+        const fallback = await fetch('songs.json');
+        if (!fallback.ok) throw error;
+        const data = await fallback.json();
+        return data.songs || [];
+    }
+}
+
+// 把仓库文件路径整理成歌曲结构：music/<歌曲名>/<文件>
+function buildSongsFromPaths(paths) {
+    const songsMap = new Map();
+    for (const path of paths) {
+        const parts = path.split('/');
+        if (parts[0] !== 'music' || parts.length < 3) continue;
+        const folderName = parts[1];
+        const fileName = parts.slice(2).join('/');
+        if (!songsMap.has(folderName)) {
+            songsMap.set(folderName, {
+                id: folderName.toLowerCase().replace(/\s+/g, '-'),
+                title: folderName,
+                artist: '未知艺术家',
+                folder: folderName,
+                hasAccompaniment: false,
+                files: {},
+            });
+        }
+        const songData = songsMap.get(folderName);
+        if (fileName.includes('[伴奏].mp3')) {
+            songData.files.accompaniment = fileName;
+            songData.hasAccompaniment = true;
+        } else if (fileName.toLowerCase().endsWith('.mp3')) {
+            songData.files.original = fileName;
+        } else if (/\.(jpe?g|png|webp)$/i.test(fileName)) {
+            songData.files.sheet = fileName;
+        }
+    }
+    console.log(`整理出 ${songsMap.size} 首歌曲`);
+    return Array.from(songsMap.values());
+}
+
 // 加载歌曲数据
 async function loadSongsData() {
     try {
         showLoading(true);
         console.log('开始加载歌曲数据...');
         
-        // The new API endpoint. This path works when deploying to Cloudflare Pages.
-        // For local development, you might need to run the worker and adjust the URL.
-        const response = await fetch('/api/songs');
-        if (!response.ok) {
-            throw new Error(`API请求失败: ${response.status} ${response.statusText}`);
-        }
-        
-        console.log('API 响应成功，开始解析数据...');
-        const dynamicData = await response.json();
-        songsData = dynamicData.songs; // The API returns an object with a "songs" property
+        // 从仓库 music/ 目录读取歌曲清单
+        songsData = await fetchSongList();
+        if (!Array.isArray(songsData)) songsData = [];
         
         console.log(`成功加载 ${songsData.length} 首歌曲`);
         
@@ -301,6 +351,11 @@ function renderSongsList(songs) {
     if (!elements.songsList || !songs) return;
     
     elements.songsList.innerHTML = '';
+    
+    if (songs.length === 0) {
+        elements.songsList.innerHTML = '<div style="padding:2.5rem 1rem;text-align:center;color:#8a8f98;line-height:1.9;">还没有歌曲<br>把歌曲文件夹上传到仓库的 <b>music/</b> 目录后，这里会自动显示</div>';
+        return;
+    }
     
     songs.forEach((song, index) => {
         const songItem = document.createElement('div');
@@ -933,7 +988,7 @@ function getPinyinLetter(char) {
 // 构建音频URL
 function buildAudioUrl(song, type) {
     const fileName = type === 'original' ? song.files.original : song.files.accompaniment;
-    const audioUrl = `${R2_BASE_URL}/${song.folder}/${fileName}`;
+    const audioUrl = `${MEDIA_BASE_URL}/${song.folder}/${fileName}`;
     console.log(`构建音频URL: ${audioUrl}`);
     console.log(`歌曲信息:`, {
         title: song.title,
@@ -1271,7 +1326,7 @@ function loadSheetMusic() {
         return;
     }
     
-    const sheetUrl = `${R2_BASE_URL}/${currentSong.folder}/${currentSong.files.sheet}`;
+    const sheetUrl = `${MEDIA_BASE_URL}/${currentSong.folder}/${currentSong.files.sheet}`;
     elements.sheetDisplay.innerHTML = `
         <img src="${sheetUrl}" alt="${currentSong.title} 歌谱" class="sheet-image" 
              onerror="this.parentElement.innerHTML='<div class=\\'sheet-placeholder\\'><p>🎼</p><p>歌谱加载失败</p></div>'">
@@ -1289,16 +1344,16 @@ async function downloadSongZip() {
         const folder = zip.folder(currentSong.title);
         
         // 下载原唱
-        await addFileToZip(folder, currentSong.files.original, `${R2_BASE_URL}/${currentSong.folder}/${currentSong.files.original}`);
+        await addFileToZip(folder, currentSong.files.original, `${MEDIA_BASE_URL}/${currentSong.folder}/${currentSong.files.original}`);
         
         // 下载伴奏（如果有）
         if (currentSong.hasAccompaniment && currentSong.files.accompaniment) {
-            await addFileToZip(folder, currentSong.files.accompaniment, `${R2_BASE_URL}/${currentSong.folder}/${currentSong.files.accompaniment}`);
+            await addFileToZip(folder, currentSong.files.accompaniment, `${MEDIA_BASE_URL}/${currentSong.folder}/${currentSong.files.accompaniment}`);
         }
         
         // 下载歌谱
         if (currentSong.files.sheet) {
-            await addFileToZip(folder, currentSong.files.sheet, `${R2_BASE_URL}/${currentSong.folder}/${currentSong.files.sheet}`);
+            await addFileToZip(folder, currentSong.files.sheet, `${MEDIA_BASE_URL}/${currentSong.folder}/${currentSong.files.sheet}`);
         }
         
         // 生成ZIP文件并下载
@@ -1322,7 +1377,7 @@ async function downloadSingleFile(type) {
 
     let fileUrl, fileName;
     const song = currentSong;
-    const baseUrl = R2_BASE_URL;
+    const baseUrl = MEDIA_BASE_URL;
 
     switch (type) {
         case 'original':
